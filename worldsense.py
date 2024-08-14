@@ -7,19 +7,26 @@ import pandas as pd
 from typing import Optional, List, Dict, Tuple, Callable, Iterable
 from ..registry import task_register
 
-from worldsense.benchmark import load_testset
+from .worldsense_source.benchmark import (
+    load_testset,
+    load_trainset)
 
 @task_register("worldsense")
 class WorldSenseFewshot(FewshotTask):
-    # load data directly
+    # locate the data
     script_path = os.path.abspath(__file__)
-    try:
-        main_test_set = load_testset("./data/test_set")
-        other_tests = dict()
-        for test in os.listdir("./data/other_tests"):
-            other_tests[test] = load_testset(f"./data/other_tests/{test}")
-    except:
-        original_data = load_testset("./data/downstream_data/worldsense/test_set")
+    task_code_base = os.path.dirname(script_path)
+    path_main_trainset = os.path.join(task_code_base, "data/training_set/trials_100k.jsonl.bz2")
+    path_testset = os.path.join(task_code_base, "data/test_set")
+    path_other_testsets = os.path.join(task_code_base, "data/other_tests")
+    # load the data
+    datasets = dict()
+    main_training_set = load_trainset(path_main_trainset); datasets['main_training_set'] = main_training_set
+    main_test_set = load_testset(path_testset); datasets['main_test_set'] = main_test_set
+    for test in os.listdir(os.path.join(task_code_base, "data/other_tests")):
+        datasets[test] = load_testset(os.path.join(task_code_base, "data/other_tests")+f"/{test}")
+    # except:
+    #    original_data = load_testset("./data/# downstream_data/worldsense/test_set")
 
     @classmethod
     def build_task(cls, *args, **kwargs):
@@ -32,7 +39,7 @@ class WorldSenseFewshot(FewshotTask):
 
     def __init__(self, train_path=None, test_path=None, **kwargs):
         # loop_inference_num_examples = range(0, 17)
-        loop_inference_num_examples = kwargs.get("loop_inference_num_examples", [5, 0])
+        loop_inference_num_examples = kwargs.get("loop_inference_num_examples", [5, 0]) 
         use_logits = kwargs.get("use_logits", False)
         generation_kwargs = {
             "use_cache": True,
@@ -40,7 +47,7 @@ class WorldSenseFewshot(FewshotTask):
             "do_sample": False,
             "top_k": 0,
             "top_p": 0.9,
-            "temperature": 0.7,
+            "temperature": 0.0,
             "repetition_penalty": 1.05,
             "return_dict_in_generate": use_logits,
             "output_scores": use_logits
@@ -57,40 +64,46 @@ class WorldSenseFewshot(FewshotTask):
                          choices=self.choices, **kwargs)
         
     def get_data(self, train_path, test_path):
-        if self.main_test_set is not None:
-            self.test_data = self.main_test_set['text'].tolist()
-        else:
-            self.test_data = load_testset(test_path)['text'].tolist()
-        random.seed(self.seed)
+        self.test_data = self.main_test_set.to_dict(orient='records')
 
     def get_label(self, example) -> str:
         return example['goldresp']
     
     def create_fewshot_prompt(self, item: Dict, num_examples=0, train_data=None, examples_strategy="random", **kwargs):
-        def split(a, b):
-            base, res = a // b, a % b
-            boxes = [base for i in range(b)]
-            res_ids = random.sample(range(b), res)
-            for i in res_ids:
-                boxes[i] += 1
+        # split the num_examples into 5 parts
+        # main_train : all_other_tests (4 parts) {\approx} 1 : 1
+        def split(num_examples):
+            base0, res0 = divmod(num_examples, 2)
+            base1, res1 = divmod(base0, 4)
+            boxes = [(base1 if i >= 1 else base0) for i in range(5)]
+            res_ids = [0] + random.sample(range(1, 5), res1)
+            for id in res_ids:
+                boxes[id] += ( 1 if id >=1 else res0 )
             return boxes
-        def sample_data(df, num):
-            format_data = lambda x : f"Q: {x['text']}\nA: {x['goldresp']}"
-            return map(format_data, random.sample(df.to_dict(orient='records'), num))
+        # format the data into the string
+        # sample data from the list(dicts)
+        def sample_data(set_name, num):
+            format_data = (
+                (lambda x : f"Q: {x['text']}\nA: {x['goldresp']}") if set_name != 'main_training_set' else 
+                (lambda x : f"Q: {x['dialog_history']['messages'][0]['content']}\nA: {x['target_message']}")
+            )
+            return map(format_data, random.sample(self.datasets[set_name].to_dict(orient='records'), num))
         
         inputs = item.get('text')
         if num_examples == 0:
             return f"Q: {inputs}\nA: "
+        elif num_examples <= 1:
+            raise ValueError("num_examples must be greater than 1")
         
         examples = []
-        split_num = split(num_examples, 4)
-        for each_split in split_num:
-            examples.extend(sample_data(train_data, each_split))
-        
-        return f"Follow the given examples and answer the question. Let's think step by step.\n{'\n'.join(examples)}\n\nQ: {inputs}\nA:."
+        splits = split(num_examples=num_examples)
+        for each_split, set in zip(splits, filter(lambda x : x != 'main_test_set', self.datasets.keys())):
+            examples.extend(sample_data(set, each_split))
+        hints = '\n\n'.join(examples)
+        return f"Follow the given examples and answer the question. Let's think step by step.\n{hints}\n\nQ: {inputs}\nA:."
     
-    # 此数据集的gold response为单选
-    # all(map(lambda x : x.isdigit() or x.isalpha(), test_set['goldresp'])) equals True
+    # 此数据集为单选，gold resp 为正确答案，expected resp 为所有可能的答案
+    # all(map(lambda x : x.isdigit() or x.isalpha(), test_set['goldresp'])) {\equals} True
     def _postprocess(self, output_str, item: Dict = None):
         if item is not None:
             expectedresp = item['expectedresp']
@@ -103,6 +116,10 @@ class WorldSenseFewshot(FewshotTask):
                 if any(map(lambda x: x in output_str.lower(), falseresp)):
                     return ''
                 return goldresp
+            else:
+                return ''
+        else:
+            return ''
    
     def not_follow_instruct(self, example, ans):
         return False
